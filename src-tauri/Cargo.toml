@@ -1,0 +1,21 @@
+[package]
+name = "chargekeeper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Offline Windows battery monitor and charge-policy simulator"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-notification = "2"
+tauri-plugin-autostart = "2"
+serde.workspace = true
+serde_json.workspace = true
+chargekeeper-core = { path = "../crates/chargekeeper-core" }
+battery = "0.7"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Power", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
