@@ -1,0 +1,11 @@
+node_modules/
+dist/
+target/
+.tools/
+*.log
+.DS_Store
+src-tauri/gen/
+artifacts/
+*.pfx
+*.p12
+*.pem
