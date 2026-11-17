@@ -98,6 +98,29 @@ restart recovery. These behaviors are design requirements, not verified features
 
 ## Security: reducing attack surface, without an “unhackable” claim
 
+Follow-up hardening: the Windows manifest explicitly uses `asInvoker`; the app
+does not request elevation. All nine custom commands are registered with Tauri's
+ACL and granted only to the local main window. Broad core, notification and
+autostart frontend permissions were removed; notifications and login changes go
+through the existing Rust commands. No remote URLs receive command access.
+Developer tools are disabled, including in the standalone debug preview.
+Configuration reads stop at 16 KiB and reject malformed schema versions instead
+of treating them as legacy data. These controls reduce exposure; they do not
+establish that the app is unhackable or production-ready.
+`asInvoker` inherits the launching process's privileges: launch from a normal
+Explorer/PowerShell session. It does not drop privileges inherited from an admin
+shell. Disabling developer tools is a convenience restriction, not an XSS defense.
+The follow-up suite passes 21 tests, plus Clippy and formatting. A separate
+subagent review confirmed that the frontend's nine commands match the generated
+ACL and native notifications/tray/startup need no direct frontend plugin grant.
+The secured standalone preview passed a five-second startup smoke test. Windows
+SDK Manifest Tool extracted its embedded execution level and verified `asInvoker`.
+The optimized release executable subsequently built successfully via
+`npm run desktop:build` at `target/release/chargekeeper.exe` (6,986,240 bytes).
+It passed a separate five-second startup smoke test; its embedded manifest was
+also verified as `asInvoker`. A SHA-256 sidecar was generated beside it. The
+executable is unsigned; the checksum does not authenticate its publisher.
+
 No program can promise that it cannot be hacked. This build limits the damage
 available through its own commands and records the work needed before elevation.
 
@@ -146,8 +169,8 @@ configuration and simulated telemetry in Rust.
   physical charging, reboot,
   password, uninstall restoration and performance tests remain unverified.
 - `cargo build -p chargekeeper --locked --offline` passes on Windows x64.
-- `cargo test --workspace --locked --offline` passes: 19 core tests plus one
-  Windows telemetry-adapter test, 20 total.
+- `cargo test --workspace --locked --offline` passes after hardening: 20 core
+  tests plus one Windows telemetry-adapter test, 21 total.
 - `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`
   and `cargo fmt --all --check` pass. The final frontend production build passes.
 - `npm run tauri -- build --debug --no-bundle` passes, producing the unsigned
@@ -157,8 +180,9 @@ configuration and simulated telemetry in Rust.
 - Raw Cargo debug builds use the development URL and need the Vite server;
   use the Tauri build command above for the standalone developer executable.
 - No Rust advisory scan, independent security audit or fuzz campaign was run.
-  Windows CI is supplied but has not run on a hosted runner. Installer creation,
-  code signing and release-mode compilation were not exercised.
+  Windows CI is supplied but has not run on a hosted runner. Installer creation
+  and code signing were not exercised. Release-mode compilation and startup
+  were subsequently verified during the executable/security follow-up above.
 
 ## Minimal shipping plan
 

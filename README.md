@@ -11,6 +11,22 @@ implementation flow, security review and shipping plan.
 
 ## Run on Windows
 
+**Run as your normal Windows user. Administrator access is not required.**
+Double-click `target/debug/chargekeeper.exe`, or run this from PowerShell:
+
+```powershell
+& 'C:\Users\patrick\Desktop\batteryProject\target\debug\chargekeeper.exe'
+```
+
+It monitors battery status and offers unplug reminders. To explore charge-control
+modes, expand **Battery simulator** and enable simulation. Running as administrator
+does not add firmware limiting: the Dell BIOS writer/service is not implemented.
+
+The app explicitly requests `asInvoker` execution. Its local main window gets
+only nine named commands, with no direct core/plugin permissions or remote-page
+access. WebView developer tools are disabled. Configuration reads are bounded to
+16 KiB and malformed schema versions are rejected.
+
 Prerequisites: Node.js 22+ and npm, stable Rust MSVC, Visual Studio Build Tools
 with Desktop development with C++, Windows SDK, and Microsoft Edge WebView2.
 Use the x64 Native Tools shell if the compiler cannot find Windows libraries.
@@ -37,9 +53,15 @@ window is hidden. The UI reads the cache every 2 seconds. Simulation advances
 
 The locally verified unsigned developer build is `target/debug/chargekeeper.exe`.
 It was built with `npm run tauri -- build --debug --no-bundle` and includes the UI;
-it does not require a running Vite server. Twenty workspace tests, Clippy,
+it does not require a running Vite server. Twenty-one workspace tests, Clippy,
 formatting and frontend build checks passed. A brief startup smoke test passed;
 interactive desktop and physical charging scenarios remain unverified.
+
+The secured release executable is now also built at
+`target/release/chargekeeper.exe` (about 6.7 MiB), with its SHA-256 checksum in
+`target/release/chargekeeper.exe.sha256`. The release passed a startup smoke test;
+its embedded Windows manifest was verified to request normal-user execution.
+It is unsigned and remains a monitor/simulator preview.
 
 If using the toolchain installed locally during development:
 
@@ -56,6 +78,22 @@ $env:CARGO_HOME = Join-Path $PWD '.tools\cargo'
 $env:RUSTUP_HOME = Join-Path $PWD '.tools\rustup'
 $env:PATH = (Join-Path $env:CARGO_HOME 'bin') + ';C:\Program Files\nodejs;' + $env:PATH
 ```
+
+## Build and distribute
+
+For a standalone executable, run `npm run desktop:build`. The result is
+`target/release/chargekeeper.exe`; no Node.js or Rust installation is required
+on the receiving PC. Microsoft Edge WebView2 Runtime must already be installed.
+Launch the executable from a normal user session.
+
+For an MSI installer, run `npm run tauri -- build --bundles msi`. Output goes to
+`target/release/bundle/msi`. Test install, launch, upgrade and uninstall before
+sharing it. Configure Authenticode signing before public distribution; hashes
+can detect a changed download but do not authenticate its publisher.
+
+This remains a monitor/simulator preview. Test reminders, tray reopening, startup
+and each simulated mode locally before sharing. Physical Dell limiting needs the
+unimplemented authenticated service and device validation described in report.md.
 
 ## What works
 
