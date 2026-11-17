@@ -48,8 +48,8 @@ Severity: H = High, M = Medium, L = Low. Status ✅ means fixed in `64c20fe` wit
 | C9 | L | `dell.rs::parse_*` | Accepted `+75` and `075` | ✅ |
 | C5 | L/M | `policy.rs` | The safety floor overrides heat protection | open, needs a product decision (Q5) |
 | C11 | L | `protocol.rs::Lease` | No owner identity | open, belongs to the service milestone |
-| C12, C13 | L | `storage.rs` | Fixed temp file name and no write-through; BOM rejected and duplicate keys accepted | open |
-| C14 | L | `policy.rs` | `reminded` isn't reset on some other paths | mostly covered by the H3 fix; re-verify |
+| C12, C13 | L | `storage.rs` | Fixed temp file name and no write-through; BOM rejected and duplicate keys accepted | **fixed** (follow-up commit): unique `create_new` temp file, `sync_all`, cleanup on failure; leading BOM stripped; duplicate keys rejected |
+| C14 | L | `policy.rs` | `reminded` isn't reset on some other paths | **fixed** (follow-up commit): early returns (floor, unsupported Top-up/heat) skipped the below-band re-arm; it now re-arms before them. Test: `reminder_rearms_below_band_even_during_early_returns` |
 
 ### Host: `src-tauri`, `scripts`, `src`
 | ID | Sev | Location | Finding | Status |

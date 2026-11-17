@@ -195,6 +195,11 @@ impl Engine {
             self.reminded = false;
             self.holding = false;
         }
+        // Re-arm once back under the sailing band, before any early return
+        // (floor, unsupported mode, heat) can skip the check further down.
+        if high <= f64::from(c.limit.saturating_sub(c.band)) {
+            self.reminded = false;
+        }
         if self.mode != c.mode {
             self.mode = c.mode;
             self.hold_since = None;
@@ -721,6 +726,37 @@ mod tests {
             ..Config::default()
         };
         assert!(!e.step(&raised, &sample(82., None), caps(), 10).inhibit);
+    }
+    #[test]
+    fn reminder_rearms_below_band_even_during_early_returns() {
+        let none = Capabilities::default();
+        let c = Config::default();
+        // An unsupported mode or heat setting returns early on AC; dropping
+        // below the band meanwhile must still re-arm the reminder.
+        let top_up = Config {
+            mode: Mode::TopUp,
+            ..Config::default()
+        };
+        let heat = Config {
+            heat_c: Some(45),
+            ..Config::default()
+        };
+        for detour in [top_up, heat] {
+            let mut e = Engine::default();
+            assert!(e.step(&c, &sample(80., None), none, 0).reminder);
+            assert!(e.step(&detour, &sample(70., None), none, 10).restore);
+            assert!(!e.step(&c, &sample(78., None), none, 20).reminder);
+            assert!(e.step(&c, &sample(80., None), none, 30).reminder);
+        }
+        // Multi-pack: the safety floor (low pack) returns early while the high
+        // pack falls below the band; the reminder re-arms all the same.
+        let mut e = Engine::default();
+        assert!(e.step(&c, &packs(&[80., 30.]), none, 0).reminder);
+        assert!(e.step(&c, &packs(&[70., 20.]), none, 10).restore);
+        assert!(!e.step(&c, &packs(&[78., 30.]), none, 20).reminder);
+        assert!(e.step(&c, &packs(&[80., 30.]), none, 30).reminder);
+        // Still no spam while above the band.
+        assert!(!e.step(&c, &packs(&[79., 30.]), none, 40).reminder);
     }
     #[test]
     fn hardware_limits_must_be_dell_expressible() {
