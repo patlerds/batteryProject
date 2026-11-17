@@ -1,5 +1,5 @@
 //! Contract for a future privileged service. No service is installed by this build.
-use crate::{dell::Bounds, Capabilities};
+use crate::{dell::Bounds, policy::SAFETY_FLOOR, Capabilities};
 use serde::{Deserialize, Serialize};
 pub const MAX_MESSAGE: usize = 4096;
 pub const LEASE_SECONDS: u64 = 30;
@@ -21,11 +21,22 @@ impl Request {
         }
         serde_json::from_slice(bytes).map_err(|_| "Invalid request".into())
     }
-    pub fn validate(&self, caps: Capabilities, bounds: Option<Bounds>) -> Result<(), String> {
+    /// `lowest_percent` is the service's own latest reading of the lowest pack.
+    /// Enabling inhibit or force-discharge is refused at or below the safety
+    /// floor, or when that reading is unknown. Disabling is always allowed.
+    /// The service must still re-check the floor on every tick while enabled.
+    pub fn validate(
+        &self,
+        caps: Capabilities,
+        bounds: Option<Bounds>,
+        lowest_percent: Option<f64>,
+    ) -> Result<(), String> {
+        let above_floor =
+            lowest_percent.is_some_and(|p| p.is_finite() && p > SAFETY_FLOOR && p <= 100.0);
         match self {
             Self::GetStatus {} | Self::RestoreDefaults {} => Ok(()),
             Self::SetLimit { percent } if caps.set_limit && (50..=100).contains(percent) => {
-                let b = bounds.ok_or("No device bounds")?;
+                let b = bounds.ok_or("No device bounds")?.effective()?;
                 let start = percent
                     .checked_sub(b.gap)
                     .ok_or("No valid start threshold")?;
@@ -33,6 +44,11 @@ impl Request {
             }
             Self::SetThresholds { start, stop } if caps.thresholds => {
                 bounds.ok_or("No device bounds")?.validate(*start, *stop)
+            }
+            Self::SetChargeInhibit { enabled } | Self::ForceDischarge { enabled }
+                if *enabled && !above_floor =>
+            {
+                Err("Refused: battery at or below the safety floor, or level unknown".into())
             }
             Self::SetChargeInhibit { .. } if caps.inhibit => Ok(()),
             Self::ForceDischarge { .. } if caps.force_discharge => Ok(()),
@@ -74,8 +90,46 @@ mod tests {
         }
         assert!(Request::decode(&vec![b' '; MAX_MESSAGE + 1]).is_err());
         assert!(Request::SetLimit { percent: 80 }
-            .validate(Capabilities::default(), None)
+            .validate(Capabilities::default(), None, Some(60.))
             .is_err());
+    }
+    #[test]
+    fn primitives_refused_at_or_below_floor() {
+        let caps = Capabilities {
+            set_limit: true,
+            thresholds: true,
+            inhibit: true,
+            force_discharge: true,
+            temperature: true,
+        };
+        for enabled_request in [
+            Request::ForceDischarge { enabled: true },
+            Request::SetChargeInhibit { enabled: true },
+        ] {
+            for lowest in [None, Some(20.), Some(5.), Some(f64::NAN)] {
+                assert!(enabled_request.validate(caps, None, lowest).is_err());
+            }
+            assert!(enabled_request.validate(caps, None, Some(60.)).is_ok());
+        }
+        for off in [
+            Request::ForceDischarge { enabled: false },
+            Request::SetChargeInhibit { enabled: false },
+        ] {
+            assert!(off.validate(caps, None, None).is_ok());
+        }
+        let wide = Bounds {
+            start_min: 0,
+            start_max: 100,
+            stop_min: 0,
+            stop_max: 100,
+            gap: 1,
+        };
+        assert!(Request::SetLimit { percent: 52 }
+            .validate(caps, Some(wide), Some(60.))
+            .is_err());
+        assert!(Request::SetLimit { percent: 80 }
+            .validate(caps, Some(wide), Some(60.))
+            .is_ok());
     }
     #[test]
     fn watchdog_expires_without_renewal() {

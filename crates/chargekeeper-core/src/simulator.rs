@@ -79,9 +79,8 @@ impl BatteryProvider for Simulator {
 }
 impl ChargeController for Simulator {
     fn set_thresholds(&mut self, start: u8, stop: u8) -> Result<(), String> {
-        if start >= stop || stop > 100 {
-            return Err("Invalid simulated thresholds".into());
-        }
+        // Honest: reject exactly what the documented Dell interface rejects.
+        crate::dell::DOCUMENTED_BOUNDS.validate(start, stop)?;
         self.start = start;
         self.stop = stop;
         Ok(())
@@ -108,7 +107,7 @@ impl Simulator {
         self.engine = Engine::default();
     }
     pub fn step(&mut self, config: &mut Config) -> Result<Simulation, String> {
-        config.validate()?;
+        config.validate_for(self.capabilities())?;
         let snap = self.snapshot()?;
         let decision: Decision = self
             .engine
@@ -185,5 +184,40 @@ mod tests {
         s.step(&mut c).unwrap();
         assert!(s.percent > 10.);
         assert!(s.charging);
+    }
+    #[test]
+    fn rejects_settings_dell_hardware_cannot_express() {
+        for (limit, band) in [(80, 2), (60, 20), (52, 2)] {
+            let mut c = Config {
+                limit,
+                band,
+                ..Config::default()
+            };
+            assert!(c.validate().is_ok());
+            assert!(Simulator::default().step(&mut c).is_err(), "{limit}/{band}");
+        }
+        let mut s = Simulator::default();
+        assert!(s.set_thresholds(78, 80).is_err());
+        assert!(s.set_thresholds(40, 60).is_err());
+        assert!(s.set_thresholds(75, 80).is_ok());
+    }
+    #[test]
+    fn topup_with_discharge_option_stays_full_until_unplugged() {
+        let mut s = Simulator::default();
+        let mut c = Config {
+            mode: Mode::TopUp,
+            discharge: true,
+            ..Config::default()
+        };
+        for _ in 0..40 {
+            s.step(&mut c).unwrap();
+        }
+        assert_eq!(c.mode, Mode::Limit);
+        assert!(s.percent >= 99., "{}", s.percent);
+        let before = s.percent;
+        for _ in 0..20 {
+            s.step(&mut c).unwrap();
+        }
+        assert!(s.percent >= before, "drained on AC: {}", s.percent);
     }
 }

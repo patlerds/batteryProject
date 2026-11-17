@@ -11,8 +11,19 @@ pub struct Bounds {
     pub stop_max: u8,
     pub gap: u8,
 }
+/// Published Dell ranges for `PrimaryBattChargeCfg=Custom:start-stop` (see
+/// docs/PLAN.md): start 50–95, stop 55–100, gap >= 5. These are a hard outer
+/// limit: device-discovered bounds can only narrow them, never widen them.
+pub const DOCUMENTED_BOUNDS: Bounds = Bounds {
+    start_min: 50,
+    start_max: 95,
+    stop_min: 55,
+    stop_max: 100,
+    gap: 5,
+};
 impl Bounds {
-    pub fn validate(&self, start: u8, stop: u8) -> Result<(), String> {
+    /// Discovered bounds intersected with `DOCUMENTED_BOUNDS`.
+    pub fn effective(&self) -> Result<Bounds, String> {
         if self.start_min > self.start_max
             || self.stop_min > self.stop_max
             || self.start_max > 100
@@ -22,15 +33,46 @@ impl Bounds {
         {
             return Err("Invalid device-reported bounds".into());
         }
-        if !(self.start_min..=self.start_max).contains(&start)
-            || !(self.stop_min..=self.stop_max).contains(&stop)
+        let d = DOCUMENTED_BOUNDS;
+        let b = Bounds {
+            start_min: self.start_min.max(d.start_min),
+            start_max: self.start_max.min(d.start_max),
+            stop_min: self.stop_min.max(d.stop_min),
+            stop_max: self.stop_max.min(d.stop_max),
+            gap: self.gap.max(d.gap),
+        };
+        if b.start_min > b.start_max || b.stop_min > b.stop_max {
+            return Err("Device bounds fall outside the documented Dell ranges".into());
+        }
+        Ok(b)
+    }
+    pub fn validate(&self, start: u8, stop: u8) -> Result<(), String> {
+        let b = self.effective()?;
+        if !(b.start_min..=b.start_max).contains(&start)
+            || !(b.stop_min..=b.stop_max).contains(&stop)
             || stop <= start
-            || stop - start < self.gap
+            || stop - start < b.gap
         {
             return Err("Thresholds outside device bounds or minimum gap".into());
         }
         Ok(())
     }
+}
+
+/// The single (limit, band) -> (start, stop) mapping: start = limit - band.
+pub fn thresholds_for(limit: u8, band: u8, bounds: Bounds) -> Result<(u8, u8), String> {
+    let start = limit.checked_sub(band).ok_or("No valid start threshold")?;
+    bounds.validate(start, limit)?;
+    Ok((start, limit))
+}
+
+/// Strict percentage: 1–3 ASCII digits, no sign, no leading zero.
+fn parse_percent(s: &str) -> Option<u8> {
+    let digits = !s.is_empty() && s.len() <= 3 && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits || (s.len() > 1 && s.starts_with('0')) {
+        return None;
+    }
+    s.parse().ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,8 +106,8 @@ pub fn parse_cctk(output: &str) -> Result<BiosConfig, String> {
         custom => {
             let range = custom.strip_prefix("custom:").ok_or("Unknown BIOS mode")?;
             let (start, stop) = range.split_once('-').ok_or("Missing Custom thresholds")?;
-            let start = start.parse::<u8>().map_err(|_| "Invalid start threshold")?;
-            let stop = stop.parse::<u8>().map_err(|_| "Invalid stop threshold")?;
+            let start = parse_percent(start).ok_or("Invalid start threshold")?;
+            let stop = parse_percent(stop).ok_or("Invalid stop threshold")?;
             if start >= stop || stop > 100 {
                 return Err("Invalid Custom thresholds".into());
             }
@@ -95,8 +137,23 @@ pub trait DellTransport {
     fn write(&mut self, config: &BiosConfig) -> Result<(), String>;
 }
 pub trait Journal {
+    /// The user's original state, if one has already been recorded.
+    fn recorded_original(&mut self) -> Result<Option<BiosConfig>, String>;
     /// Implementation must durably persist original state BEFORE returning.
+    /// `apply_verified` calls this only when `recorded_original` is `None`
+    /// (first write wins), so Chargekeeper's own values never replace it.
     fn record_original(&mut self, original: &BiosConfig) -> Result<(), String>;
+}
+fn write_and_verify(
+    transport: &mut impl DellTransport,
+    config: &BiosConfig,
+) -> Result<BiosConfig, String> {
+    transport.write(config)?;
+    let actual = transport.read()?;
+    if actual != *config {
+        return Err("BIOS readback mismatch; enforcement is unconfirmed".into());
+    }
+    Ok(actual)
 }
 pub fn apply_verified(
     transport: &mut impl DellTransport,
@@ -105,14 +162,22 @@ pub fn apply_verified(
     bounds: Option<Bounds>,
 ) -> Result<BiosConfig, String> {
     cctk_args(config, bounds)?;
-    let original = transport.read()?;
-    journal.record_original(&original)?;
-    transport.write(config)?;
-    let actual = transport.read()?;
-    if actual != *config {
-        return Err("BIOS readback mismatch; enforcement is unconfirmed".into());
+    let previous = transport.read()?;
+    if journal.recorded_original()?.is_none() {
+        journal.record_original(&previous)?;
     }
-    Ok(actual)
+    let error = match write_and_verify(transport, config) {
+        Ok(actual) => return Ok(actual),
+        Err(error) => error,
+    };
+    // Roll back to the pre-write state, but never write a value that fails the
+    // documented/discovered bounds (e.g. an out-of-range Custom read earlier).
+    let rollback =
+        cctk_args(&previous, bounds).and_then(|_| write_and_verify(transport, &previous));
+    Err(match rollback {
+        Ok(_) => format!("{error}; previous BIOS setting restored"),
+        Err(e) => format!("{error}; ROLLBACK FAILED: {e}"),
+    })
 }
 
 #[cfg(test)]
@@ -168,58 +233,192 @@ mod tests {
         }
         assert!(B.validate(50, 55).is_ok());
     }
+    #[test]
+    fn discovered_bounds_cannot_widen_documented_ranges() {
+        let wide = Bounds {
+            start_min: 0,
+            start_max: 100,
+            stop_min: 0,
+            stop_max: 100,
+            gap: 1,
+        };
+        assert_eq!(wide.effective().unwrap(), DOCUMENTED_BOUNDS);
+        for (start, stop) in [(0, 1), (20, 40), (49, 80), (78, 80), (96, 100)] {
+            assert!(wide.validate(start, stop).is_err(), "{start}-{stop}");
+        }
+        assert!(cctk_args(&BiosConfig::Custom { start: 0, stop: 1 }, Some(wide)).is_err());
+        assert!(wide.validate(50, 55).is_ok());
+        let narrow = Bounds {
+            start_min: 60,
+            start_max: 85,
+            stop_min: 70,
+            stop_max: 90,
+            gap: 10,
+        };
+        assert!(narrow.validate(50, 80).is_err());
+        assert!(narrow.validate(75, 80).is_err());
+        assert!(narrow.validate(70, 80).is_ok());
+        let disjoint = Bounds {
+            start_min: 10,
+            start_max: 40,
+            ..DOCUMENTED_BOUNDS
+        };
+        assert!(disjoint.effective().is_err());
+        assert_eq!(thresholds_for(80, 5, B), Ok((75, 80)));
+        assert!(thresholds_for(80, 2, B).is_err());
+        assert!(thresholds_for(60, 20, B).is_err());
+    }
+    #[test]
+    fn strict_threshold_digits() {
+        for value in [
+            "PrimaryBattChargeCfg=Custom:+75-80",
+            "PrimaryBattChargeCfg=Custom:075-080",
+            "PrimaryBattChargeCfg=Custom:75-+80",
+            "PrimaryBattChargeCfg=Custom: 75-80",
+            "PrimaryBattChargeCfg=Custom:75-1000",
+        ] {
+            assert!(parse_cctk(value).is_err(), "{value}");
+        }
+    }
     struct Mock {
         current: BiosConfig,
         ignore: bool,
-        writes: u8,
+        writes: Vec<BiosConfig>,
+        /// Next write lands as this value instead (firmware substitution).
+        substitute: Option<BiosConfig>,
+        /// Next write partially applies `substitute` and then errors.
+        fail_next_write: bool,
+    }
+    impl Mock {
+        fn new(current: BiosConfig) -> Self {
+            Self {
+                current,
+                ignore: false,
+                writes: Vec::new(),
+                substitute: None,
+                fail_next_write: false,
+            }
+        }
     }
     impl DellTransport for Mock {
         fn read(&mut self) -> Result<BiosConfig, String> {
             Ok(self.current.clone())
         }
         fn write(&mut self, c: &BiosConfig) -> Result<(), String> {
-            self.writes += 1;
-            if !self.ignore {
+            self.writes.push(c.clone());
+            if let Some(s) = self.substitute.take() {
+                self.current = s;
+            } else if !self.ignore {
                 self.current = c.clone();
+            }
+            if std::mem::take(&mut self.fail_next_write) {
+                return Err("cctk exited with an error".into());
             }
             Ok(())
         }
     }
+    /// Deliberately naive: overwrites on every call, so it cannot hide a
+    /// caller that records Chargekeeper's own value as the "original".
     struct Log {
         fail: bool,
         original: Option<BiosConfig>,
+        records: u8,
     }
     impl Journal for Log {
+        fn recorded_original(&mut self) -> Result<Option<BiosConfig>, String> {
+            Ok(self.original.clone())
+        }
         fn record_original(&mut self, c: &BiosConfig) -> Result<(), String> {
             if self.fail {
                 return Err("Disk failure".into());
             }
-            self.original.get_or_insert(c.clone());
+            self.records += 1;
+            self.original = Some(c.clone());
             Ok(())
         }
     }
+    fn log() -> Log {
+        Log {
+            fail: false,
+            original: None,
+            records: 0,
+        }
+    }
+    const CFG: BiosConfig = BiosConfig::Custom {
+        start: 75,
+        stop: 80,
+    };
     #[test]
     fn journal_failure_prevents_write_and_readback_failure_is_error() {
-        let mut m = Mock {
-            current: BiosConfig::Adaptive,
-            ignore: true,
-            writes: 0,
-        };
+        let mut m = Mock::new(BiosConfig::Adaptive);
+        m.ignore = true;
         let mut j = Log {
             fail: true,
-            original: None,
+            ..log()
         };
-        let cfg = BiosConfig::Custom {
-            start: 75,
-            stop: 80,
-        };
-        assert!(apply_verified(&mut m, &mut j, &cfg, Some(B)).is_err());
-        assert_eq!(m.writes, 0);
+        assert!(apply_verified(&mut m, &mut j, &CFG, Some(B)).is_err());
+        assert!(m.writes.is_empty());
         j.fail = false;
-        assert!(apply_verified(&mut m, &mut j, &cfg, Some(B)).is_err());
+        assert!(apply_verified(&mut m, &mut j, &CFG, Some(B)).is_err());
         assert_eq!(j.original, Some(BiosConfig::Adaptive));
         m.ignore = false;
-        assert_eq!(apply_verified(&mut m, &mut j, &cfg, Some(B)).unwrap(), cfg);
+        assert_eq!(apply_verified(&mut m, &mut j, &CFG, Some(B)).unwrap(), CFG);
         assert_eq!(j.original, Some(BiosConfig::Adaptive));
+    }
+    #[test]
+    fn first_recorded_original_wins_across_applies() {
+        let mut m = Mock::new(BiosConfig::Adaptive);
+        let mut j = log();
+        assert_eq!(apply_verified(&mut m, &mut j, &CFG, Some(B)).unwrap(), CFG);
+        let next = BiosConfig::Custom {
+            start: 60,
+            stop: 70,
+        };
+        assert_eq!(
+            apply_verified(&mut m, &mut j, &next, Some(B)).unwrap(),
+            next
+        );
+        assert_eq!(apply_verified(&mut m, &mut j, &CFG, Some(B)).unwrap(), CFG);
+        assert_eq!(j.original, Some(BiosConfig::Adaptive));
+        assert_eq!(j.records, 1);
+    }
+    #[test]
+    fn readback_mismatch_rolls_back_to_previous_state() {
+        let mut m = Mock::new(BiosConfig::Express);
+        m.substitute = Some(BiosConfig::Standard);
+        let e = apply_verified(&mut m, &mut log(), &CFG, Some(B)).unwrap_err();
+        assert!(e.contains("mismatch") && e.contains("restored"), "{e}");
+        assert_eq!(m.writes, [CFG, BiosConfig::Express]);
+        assert_eq!(m.current, BiosConfig::Express);
+    }
+    #[test]
+    fn write_error_rolls_back_and_reports_failed_rollback() {
+        let mut m = Mock::new(BiosConfig::Adaptive);
+        m.substitute = Some(BiosConfig::Standard);
+        m.fail_next_write = true;
+        let e = apply_verified(&mut m, &mut log(), &CFG, Some(B)).unwrap_err();
+        assert!(e.contains("restored"), "{e}");
+        assert_eq!(m.current, BiosConfig::Adaptive);
+        // Rollback that does not take is reported, never hidden.
+        let mut m = Mock::new(BiosConfig::Adaptive);
+        m.ignore = true;
+        let e = apply_verified(&mut m, &mut log(), &CFG, Some(B)).unwrap_err();
+        assert!(e.contains("mismatch"), "{e}");
+        // ignore=true: current stays Adaptive, so rollback readback matches.
+        let mut m = Mock::new(BiosConfig::Adaptive);
+        m.substitute = Some(BiosConfig::Standard);
+        m.ignore = true;
+        let e = apply_verified(&mut m, &mut log(), &CFG, Some(B)).unwrap_err();
+        assert!(e.contains("ROLLBACK FAILED"), "{e}");
+        assert_eq!(m.current, BiosConfig::Standard);
+    }
+    #[test]
+    fn out_of_bounds_previous_state_is_never_written_back() {
+        let bad = BiosConfig::Custom { start: 0, stop: 1 };
+        let mut m = Mock::new(bad.clone());
+        m.substitute = Some(BiosConfig::Standard);
+        let e = apply_verified(&mut m, &mut log(), &CFG, Some(B)).unwrap_err();
+        assert!(e.contains("ROLLBACK FAILED"), "{e}");
+        assert_eq!(m.writes, [CFG]);
     }
 }

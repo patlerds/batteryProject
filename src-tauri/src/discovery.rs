@@ -12,6 +12,9 @@ pub struct Discovery {
     pub bios: String,
     pub wmi: bool,
     pub cctk: bool,
+    /// `not_checked`, `present`, `absent`, `denied` or `error`; empty if the probe failed.
+    #[serde(default)]
+    pub wmi_status: String,
     pub note: String,
 }
 
