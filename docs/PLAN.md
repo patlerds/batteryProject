@@ -95,7 +95,9 @@ never drains below 20%, and must cancel on stale telemetry or loss of ownership.
 
 ## Current hardware evidence and risks
 
-Read-only WMI reports Dell Inc., Latitude 7320 Detachable. Win32_Battery returned
+Read-only WMI reports Dell Inc., Latitude 7320 Detachable, BIOS 1.50.0. A subsequent
+read-only discovery probe found neither Dell Monitor WMI nor CCTK in the standard
+paths. Firmware controls remain unavailable. Win32_Battery returned
 no instances during the initial probe; this does not prove the hardware lacks a
 battery. Dell provider presence, battery IOCTLs, firmware range discovery and
 charge enforcement remain separate checks. BIOS updates can invalidate capability
