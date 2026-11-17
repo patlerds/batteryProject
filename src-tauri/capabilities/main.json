@@ -1,7 +1,18 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
-  "description": "Local window with notifications and current-user startup only; no shell or filesystem access.",
+  "description": "Only explicitly listed app commands from the local main window. No direct core/plugin, filesystem, shell, or remote-page access.",
+  "local": true,
   "windows": ["main"],
-  "permissions": ["core:default", "notification:default", "autostart:default"]
+  "permissions": [
+    "allow-get-status",
+    "allow-save-config",
+    "allow-set-simulation",
+    "allow-set-simulated-battery",
+    "allow-restore-defaults",
+    "allow-export-diagnostics",
+    "allow-set-launch-at-login",
+    "allow-get-launch-at-login",
+    "allow-open-dell-support"
+  ]
 }

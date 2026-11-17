@@ -10,7 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [{ "title": "Chargekeeper", "width": 820, "height": 810, "minWidth": 620, "minHeight": 600 }],
+    "windows": [{ "title": "Chargekeeper", "width": 820, "height": 810, "minWidth": 620, "minHeight": 600, "devtools": false }],
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'",
       "capabilities": ["main"]
