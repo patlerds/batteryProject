@@ -10,6 +10,27 @@ against mocks only.
 
 ## [Unreleased]
 
+### Added
+
+- Critical-heat stop (C5): at 50 C or more the engine never charges, even
+  below the 20% safety floor and in every mode, and never force-discharges.
+  It latches until the battery falls below 45 C. Below the critical level the
+  floor still beats normal heat protection. A `heat_c` setting above the
+  critical stop is rejected.
+- Decision notices (`top_up_started`, `top_up_complete`, `critical_heat`),
+  edge-triggered and emitted even when the device has no hardware capabilities.
+- Desktop toasts for these notices with bounded retry. The critical-heat toast
+  is shown even when notifications are off and jumps the queue.
+- Status now exposes `notice`, `notice_id` and `active_critical_heat`. The UI
+  has a dismissible top-up banner, a non-dismissible red critical-heat banner,
+  readable reason text, and a note when the device reports no battery temperature.
+- Discovery detects Dell's built-in BIOS WMI provider and reports instance
+  read status (present, denied, absent, error) separately. A cycle count of 0
+  is reported as unavailable, and a `temperature_available` flag was added.
+- `scripts/dell-read-elevated.ps1`: a strictly read-only script, run by the
+  owner and never by the app, that queries battery/charge BIOS attributes and
+  the password-set status. It includes a self-test.
+
 ### Fixed
 
 - Calibration no longer asks the battery to stop charging and force-discharge
@@ -60,6 +81,8 @@ against mocks only.
 
 - Replaced `tauri-plugin-autostart` and `tauri-plugin-notification` with direct
   use of `auto-launch` 0.6 and `notify-rust` 4.18. Both were already in the lockfile.
+- Top-up now stays full after it completes and the user is notified, instead
+  of draining back to the limit (owner decision on C2).
 - Config validation now depends on the device's capabilities (`validate_for`).
 - `Journal` gained a required method, and `Request::validate` gained an
   argument. Neither is used by the desktop app yet.
@@ -71,3 +94,9 @@ against mocks only.
 - Open items not fixed here: heat protection versus the safety floor (C5),
   lease owner identity (C11), worker supervision (H5), start hidden in the
   tray (H7), a hard-coded PowerShell path (H8), plus H9-H12.
+- Added a read-only raw discovery of the Latitude 7320 to `docs/DEVICES.md`
+  (M-C): Dell's built-in BIOS WMI provider is present, but charge attributes
+  and password status are access denied to a normal user.
+- The Latitude 7320 reports no battery temperature (`BatteryTemperature` has
+  0 instances), so critical-heat protection cannot trigger on that device.
+- C5 is now fixed (see above); it is no longer an open item.

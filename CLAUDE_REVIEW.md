@@ -46,7 +46,7 @@ Severity: H = High, M = Medium, L = Low. Status ✅ means fixed in `64c20fe` wit
 | C6 | M | `policy.rs::Config::validate` | Accepted limit/band pairs that Dell can't express, and the simulator applied them anyway | ✅ `validate_for(caps)`, also wired into `save_config` and `set_simulation` |
 | C10 | M | `protocol.rs::Request::validate` | Clients could turn on inhibit or force-discharge with no floor check | ✅ refused at or below 20% or when unknown. The future service must still re-check on every tick |
 | C9 | L | `dell.rs::parse_*` | Accepted `+75` and `075` | ✅ |
-| C5 | L/M | `policy.rs` | The safety floor overrides heat protection | open, needs a product decision (Q5) |
+| C5 | L/M | `policy.rs` | The safety floor overrides heat protection | ✅ fixed on `claude/heat-topup-notices` (`5340055`). Owner decision: a 50 °C critical stop, latched until 45 °C, beats the floor in every mode, and the user is notified |
 | C11 | L | `protocol.rs::Lease` | No owner identity | open, belongs to the service milestone |
 | C12, C13 | L | `storage.rs` | Fixed temp file name and no write-through; BOM rejected and duplicate keys accepted | **fixed** (follow-up commit): unique `create_new` temp file, `sync_all`, cleanup on failure; leading BOM stripped; duplicate keys rejected |
 | C14 | L | `policy.rs` | `reminded` isn't reset on some other paths | **fixed** (follow-up commit): early returns (floor, unsupported Top-up/heat) skipped the below-band re-arm; it now re-arms before them. Test: `reminder_rearms_below_band_even_during_early_returns` |
@@ -128,9 +128,26 @@ The future privileged **service** should be a new crate, such as `crates/chargek
 
 ## 7. Open questions for Patrick
 
-1. **Q1:** May an agent install official Dell Command | Monitor and/or Configure, for **read-only** discovery only?
+1. **Q1 (answered: yes, raw-first approved):** May an agent install official Dell Command | Monitor and/or Configure, for **read-only** discovery only?
 2. **Q2:** Please share the earlier subagents' `.md` files or chat reports (the `/root/ui_review` review and any AGENTS.md) if you have them.
-3. **Q3:** Is a BIOS setup or admin password set? Answer yes or no only; don't send the password.
-4. **Q4:** Should `64c20fe` and this review be pushed to `origin/master`? I did not push, because pushing publishes and wasn't explicitly requested.
-5. **Q5 (C5):** When the battery is hot **and** below 20%, should heat protection win (stop charging) or the safety floor (keep charging)? The current code lets the floor win.
-6. **Q6:** For C2, do you want an explicit "drain back to the limit after a top-up" option, or is staying full while on AC fine?
+3. **Q3 (unknown, pending the owner running `scripts/dell-read-elevated.ps1`):** Is a BIOS setup or admin password set? Answer yes or no only; don't send the password.
+4. **Q4 (answered: push approved via branches/PRs):** Should `64c20fe` and this review be pushed to `origin/master`? I did not push, because pushing publishes and wasn't explicitly requested.
+5. **Q5 (C5, answered: the 50 °C critical stop beats the floor and the user is notified):** When the battery is hot **and** below 20%, should heat protection win (stop charging) or the safety floor (keep charging)? The current code lets the floor win.
+6. **Q6 (answered: top-up stays full and the user is notified):** For C2, do you want an explicit "drain back to the limit after a top-up" option, or is staying full while on AC fine?
+
+## 8. Milestone M-C (partial): read-only discovery, C5 and notices
+
+**Discovery findings** (Latitude 7320, BIOS 1.50.0, full detail in `docs/DEVICES.md`): Dell's built-in BIOS WMI provider is present, but the charge attributes and password status are access denied to a normal user. No Dell software is installed. The battery is readable, but no battery temperature is exposed. Nothing was written or run elevated.
+
+**Files:** `crates/chargekeeper-core/src/policy.rs`, `crates/chargekeeper-core/src/simulator.rs`, `docs/DEVICES.md` (`5340055`); `src-tauri/src/main.rs`, `src-tauri/src/discovery.rs`, `scripts/discover.ps1`, `scripts/dell-read-elevated.ps1`, `src/main.tsx`, `src/styles.css` (`3e89a6b`).
+
+**Commits:** `5340055` (core: critical-heat stop, top-up notices) and `3e89a6b` (desktop: toasts, banners, Dell provider detection).
+
+**Tests:** 65 passed (51 core + 14 host); lint and build pass.
+
+**Open items:**
+1. The owner must run the elevated, read-only `scripts/dell-read-elevated.ps1` to settle Q3 and read the charge attributes.
+2. Threshold-only devices cannot do a critical stop below the limit.
+3. This device reports no temperature, so critical-heat protection cannot trigger here.
+4. The critical-heat toast is not yet verified in simulation.
+5. Toasts are untested on an installed build, and no real heat event has been seen.
