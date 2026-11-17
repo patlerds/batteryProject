@@ -4,7 +4,7 @@ mod logging;
 mod telemetry;
 
 use chargekeeper_core::{
-    policy::{Config, Engine, Mode},
+    policy::{Config, Engine, Mode, Notice},
     simulator::Simulator,
     storage, Capabilities, Snapshot,
 };
@@ -73,9 +73,9 @@ impl ReminderDelivery {
     }
 }
 
-/// Shows the unplug toast synchronously so a Windows error is observable (the
+/// Shows a toast synchronously so a Windows error is observable (the
 /// notification plugin dispatches on a background task and drops every error).
-fn show_reminder(identifier: &str, limit: u8) -> bool {
+fn show_toast(identifier: &str, summary: &str, body: &str) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
@@ -84,9 +84,7 @@ fn show_reminder(identifier: &str, limit: u8) -> bool {
         .map(|d| d.display().to_string())
         .unwrap_or_default();
     let mut toast = notify_rust::Notification::new();
-    toast.summary("Time to unplug").body(&format!(
-        "Your battery has reached {limit}%. Chargekeeper cannot stop charging on this device."
-    ));
+    toast.summary(summary).body(body);
     toast.auto_icon();
     // Same rule as tauri-plugin-notification: use the app's AUMID only outside
     // target\debug and target\release (there Windows attributes it to PowerShell).
@@ -94,6 +92,91 @@ fn show_reminder(identifier: &str, limit: u8) -> bool {
         toast.app_id(identifier);
     }
     toast.show().is_ok()
+}
+
+fn show_reminder(identifier: &str, limit: u8) -> bool {
+    show_toast(
+        identifier,
+        "Time to unplug",
+        &format!(
+            "Your battery has reached {limit}%. Chargekeeper cannot stop charging on this device."
+        ),
+    )
+}
+
+/// Toast text for an engine notice. `can_stop` is whether Chargekeeper can
+/// actually inhibit charging here; on a monitor-only device the critical-heat
+/// message tells the user to unplug instead of claiming charging stopped.
+fn notice_message(notice: Notice, can_stop: bool) -> &'static str {
+    match notice {
+        Notice::TopUpStarted => {
+            "Top-up started: charging to 100%. It will stay full until you unplug."
+        }
+        Notice::TopUpComplete => "Top-up complete: battery is full.",
+        Notice::CriticalHeat if can_stop => {
+            "Battery critically hot (≥50 °C). Charging is stopped. Unplug the charger, let the laptop cool, and keep it on a hard surface."
+        }
+        Notice::CriticalHeat => {
+            "Battery critically hot (≥50 °C). Unplug the charger now and let the laptop cool."
+        }
+    }
+}
+
+/// Critical heat is a safety warning and is always shown; the top-up notices
+/// follow the user's notifications preference.
+fn should_toast(notice: Notice, notifications_enabled: bool) -> bool {
+    notice == Notice::CriticalHeat || notifications_enabled
+}
+
+/// Host-side delivery of engine notices, with the same bounded retry as reminders.
+/// The engine emits each notice once; this keeps a refused toast queued for a few
+/// polls. Critical heat always goes to the front of the queue.
+#[derive(Default)]
+struct NoticeDelivery {
+    queue: Vec<Notice>,
+    failures: u8,
+    last_failed: bool,
+}
+
+impl NoticeDelivery {
+    fn push(&mut self, notice: Notice) {
+        if self.queue.contains(&notice) {
+            return;
+        }
+        if notice == Notice::CriticalHeat {
+            // Preempts whatever was being retried; that one restarts its attempts.
+            self.queue.insert(0, notice);
+            self.failures = 0;
+        } else {
+            self.queue.push(notice);
+        }
+    }
+
+    fn due(&self) -> Option<Notice> {
+        self.queue.first().copied()
+    }
+
+    /// Records the outcome of an attempt on the head; returns a static event name to log.
+    fn record(&mut self, delivered: bool) -> Option<&'static str> {
+        if self.queue.is_empty() {
+            return None;
+        }
+        if delivered {
+            self.queue.remove(0);
+            self.failures = 0;
+            self.last_failed = false;
+            return None;
+        }
+        self.failures = self.failures.saturating_add(1);
+        self.last_failed = true;
+        if self.failures >= MAX_REMINDER_ATTEMPTS {
+            self.queue.remove(0);
+            self.failures = 0;
+            Some("notice_failed_gave_up")
+        } else {
+            Some("notice_failed")
+        }
+    }
 }
 
 /// Launch-at-login entry, forced to HKCU (never the machine-wide HKLM Run key that
@@ -154,7 +237,16 @@ struct AppState {
     phase: String,
     sampled_at: Instant,
     reminders: ReminderDelivery,
+    notices: NoticeDelivery,
+    /// Most recent engine notice, for the UI banner, and a counter that changes
+    /// with every new notice so the UI can tell a repeat from the one dismissed.
+    last_notice: Option<Notice>,
+    notice_id: u64,
 }
+
+/// The engine's reason code while the critical-heat stop is engaged.
+const CRITICAL_HEAT_REASON: &str = "critical_heat";
+
 #[derive(Serialize)]
 struct Status {
     config: Config,
@@ -168,6 +260,11 @@ struct Status {
     config_error: Option<String>,
     /// The most recent reminder toast could not be shown by Windows.
     reminder_failed: bool,
+    /// Latest notice from the engine (top-up started/complete, critical heat).
+    notice: Option<Notice>,
+    notice_id: u64,
+    /// The critical-heat stop is engaged right now.
+    active_critical_heat: bool,
 }
 
 fn lock<'a>(
@@ -216,6 +313,9 @@ fn get_status(state: State<'_, Mutex<AppState>>) -> Result<Status, String> {
         discovery: s.discovery.clone(),
         config_error: s.config_error.clone(),
         reminder_failed: s.reminders.last_failed,
+        notice: s.last_notice,
+        notice_id: s.notice_id,
+        active_critical_heat: s.reason == CRITICAL_HEAT_REASON,
     })
 }
 
@@ -248,11 +348,13 @@ fn poll(app: &tauri::AppHandle) {
     }
     let mut fresh_reminder = None;
     let mut relevant = None;
+    let mut notice = None;
     if simulated {
         let mut cfg = s.config.clone();
         match s.sim.step(&mut cfg) {
             Ok(sample) => {
                 s.config = cfg;
+                notice = sample.notice;
                 s.snapshot = sample.snapshot;
                 s.reason = sample.reason;
                 s.phase = format!("{:?}", sample.phase);
@@ -271,6 +373,7 @@ fn poll(app: &tauri::AppHandle) {
                 if d.reminder {
                     fresh_reminder = Some(cfg.limit);
                 }
+                notice = d.notice;
                 if let Some(limit) = s.reminders.pending {
                     relevant = Some(
                         snapshot.ac == Some(true)
@@ -290,6 +393,14 @@ fn poll(app: &tauri::AppHandle) {
     let percent = s.snapshot.highest();
     s.sampled_at = Instant::now();
     let reminder = s.reminders.due(fresh_reminder, relevant);
+    if let Some(n) = notice {
+        s.last_notice = Some(n);
+        s.notice_id = s.notice_id.wrapping_add(1);
+        if should_toast(n, s.config.notifications) {
+            s.notices.push(n);
+        }
+    }
+    let pending_notice = s.notices.due();
     drop(s);
     if let Some(limit) = reminder {
         // Shown outside the lock; the outcome is recorded so a refused toast is retried.
@@ -297,6 +408,23 @@ fn poll(app: &tauri::AppHandle) {
         if let Ok(mut s) = state.lock() {
             if let Some(event) = s.reminders.record(delivered) {
                 logging::event(&s.diagnostics, event);
+            }
+        }
+    }
+    if let Some(n) = pending_notice {
+        let summary = if simulated {
+            "Chargekeeper simulation"
+        } else {
+            "Chargekeeper"
+        };
+        let body = notice_message(n, effective_caps(simulated).inhibit);
+        let delivered = show_toast(&app.config().identifier, summary, body);
+        if let Ok(mut s) = state.lock() {
+            // A session switch while the toast was shown already reset the queue.
+            if s.simulated == simulated && s.notices.due() == Some(n) {
+                if let Some(event) = s.notices.record(delivered) {
+                    logging::event(&s.diagnostics, event);
+                }
             }
         }
     }
@@ -352,6 +480,8 @@ fn set_simulation(enabled: bool, state: State<'_, Mutex<AppState>>) -> Result<()
     s.sim = Simulator::default();
     s.engine = Engine::default();
     s.reminders = ReminderDelivery::default();
+    s.notices = NoticeDelivery::default();
+    s.last_notice = None;
     s.simulated = enabled;
     s.snapshot = unavailable();
     s.reason = "Waiting for the next background sample".into();
@@ -520,6 +650,9 @@ fn main() {
                 sampled_at: Instant::now(),
                 diagnostics,
                 reminders: ReminderDelivery::default(),
+                notices: NoticeDelivery::default(),
+                last_notice: None,
+                notice_id: 0,
             }));
             let handle = app.handle().clone();
             std::thread::spawn(move || {
@@ -619,6 +752,65 @@ mod tests {
         assert_eq!(r.due(Some(80), None), Some(80));
         assert_eq!(r.record(true), None);
         assert!(!r.last_failed);
+    }
+
+    #[test]
+    fn notice_messages_match_owner_wording() {
+        for can_stop in [true, false] {
+            assert_eq!(
+                notice_message(Notice::TopUpStarted, can_stop),
+                "Top-up started: charging to 100%. It will stay full until you unplug."
+            );
+            assert_eq!(
+                notice_message(Notice::TopUpComplete, can_stop),
+                "Top-up complete: battery is full."
+            );
+        }
+        assert_eq!(
+            notice_message(Notice::CriticalHeat, true),
+            "Battery critically hot (≥50 °C). Charging is stopped. Unplug the charger, let the laptop cool, and keep it on a hard surface."
+        );
+        // Monitor-only devices never claim that charging was stopped.
+        let monitor_only = notice_message(Notice::CriticalHeat, false);
+        assert_eq!(
+            monitor_only,
+            "Battery critically hot (≥50 °C). Unplug the charger now and let the laptop cool."
+        );
+        assert!(!monitor_only.contains("stopped"));
+        // The real (non-simulated) session is monitor-only.
+        assert!(!effective_caps(false).inhibit);
+        assert!(effective_caps(true).inhibit);
+    }
+
+    #[test]
+    fn critical_heat_ignores_notifications_off() {
+        assert!(should_toast(Notice::CriticalHeat, false));
+        assert!(should_toast(Notice::CriticalHeat, true));
+        for n in [Notice::TopUpStarted, Notice::TopUpComplete] {
+            assert!(should_toast(n, true), "{n:?}");
+            assert!(!should_toast(n, false), "{n:?}");
+        }
+    }
+
+    #[test]
+    fn notice_delivery_retries_bounded_and_heat_jumps_queue() {
+        let mut d = NoticeDelivery::default();
+        assert_eq!(d.record(false), None);
+        d.push(Notice::TopUpStarted);
+        d.push(Notice::TopUpStarted);
+        assert_eq!(d.due(), Some(Notice::TopUpStarted));
+        assert_eq!(d.record(false), Some("notice_failed"));
+        assert!(d.last_failed);
+        d.push(Notice::CriticalHeat);
+        assert_eq!(d.due(), Some(Notice::CriticalHeat));
+        assert_eq!(d.record(false), Some("notice_failed"));
+        assert_eq!(d.record(false), Some("notice_failed"));
+        assert_eq!(d.record(false), Some("notice_failed_gave_up"));
+        // The top-up notice is still queued after the heat warning.
+        assert_eq!(d.due(), Some(Notice::TopUpStarted));
+        assert_eq!(d.record(true), None);
+        assert!(!d.last_failed);
+        assert_eq!(d.due(), None);
     }
 
     #[test]

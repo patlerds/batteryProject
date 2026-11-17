@@ -12,7 +12,17 @@ type Status = {
   simulated: boolean; mechanism: string; reason: string; phase: string;
   discovery: { manufacturer: string; model: string; bios: string; wmi: boolean; cctk: boolean; note: string };
   config_error: string | null;
+  notice?: Notice | null; notice_id?: number; active_critical_heat?: boolean;
 };
+type Notice = 'top_up_started' | 'top_up_complete' | 'critical_heat';
+const noticeText: Record<Exclude<Notice, 'critical_heat'>, string> = {
+  top_up_started: 'Top-up started: charging to 100%. It will stay full until you unplug.',
+  top_up_complete: 'Top-up complete: battery is full.',
+};
+const reasonText: Record<string, string> = { critical_heat: 'Charging stopped: battery critically hot' };
+// Monitor-only devices cannot stop charging, so never claim that they did.
+const reasonLabel = (reason: string, canStop = true) => reason === 'critical_heat' && !canStop ? 'Battery critically hot: unplug the charger' : reasonText[reason] ?? reason;
+const noTemperatureNote = "This device doesn't report battery temperature, so heat protection can't work here.";
 const desktop = isTauri();
 const defaults: Config = { schema: 1, limit: 80, band: 5, mode: 'limit', heat_c: null, discharge: false, notifications: true };
 const preview: Status = {
@@ -37,6 +47,7 @@ function App() {
   const [simTemp, setSimTemp] = useState(31);
   const [simAc, setSimAc] = useState(true);
   const refreshing = useRef(false);
+  const [dismissedNotice, setDismissedNotice] = useState<number | null>(null);
 
   const refresh = useCallback(async () => {
     if (!desktop || refreshing.current) return;
@@ -88,6 +99,12 @@ function App() {
   const canCalibrate = caps.inhibit && caps.force_discharge;
   const canHeat = caps.temperature && caps.inhibit;
   const progress = battery?.percent ?? 0;
+  const criticalHeat = status.active_critical_heat === true || status.reason === 'critical_heat';
+  const topUpNotice = status.notice && status.notice !== 'critical_heat' && status.notice_id !== dismissedNotice ? status.notice : null;
+  const noTemperature = desktop && !batteries.some((b) => b.temperature_c != null && Number.isFinite(b.temperature_c));
+  const criticalHeatText = caps.inhibit
+    ? 'Charging is stopped. Unplug the charger, let the laptop cool, and keep it on a hard surface.'
+    : 'Unplug the charger now and let the laptop cool.';
 
   return <main className="app-shell">
     <header className="app-header">
@@ -97,7 +114,9 @@ function App() {
 
     {!desktop && <div className="notice"><strong>Browser preview</strong> · No live battery data or hardware controls. Run the Windows app to connect your device.</div>}
     {status.simulated && <div className="notice simulation-notice"><strong>Simulation is on.</strong> All battery values and controls below are simulated. Your hardware is unchanged.</div>}
-    {desktop && !status.snapshot.fresh && <div className="notice" role="status"><strong>Battery readings unavailable.</strong> {status.reason}</div>}
+    {criticalHeat && <div className="notice critical" role="alert"><strong>{caps.inhibit ? reasonLabel('critical_heat') : 'Battery critically hot'} (≥50 °C).</strong> {criticalHeatText}</div>}
+    {topUpNotice && <div className="notice dismissible" role="status"><span>{noticeText[topUpNotice]}</span><button className="notice-dismiss" aria-label="Dismiss top-up notice" onClick={() => setDismissedNotice(status.notice_id ?? null)}>×</button></div>}
+    {desktop && !status.snapshot.fresh && <div className="notice" role="status"><strong>Battery readings unavailable.</strong> {reasonLabel(status.reason, caps.inhibit)}</div>}
     {error && <div className="notice error" role="alert">{error}<span>Displayed readings may be out of date.</span></div>}
     {status.config_error && <div className="notice error" role="alert">Configuration needs attention: {status.config_error}. The existing file has been preserved.</div>}
 
@@ -112,7 +131,7 @@ function App() {
       <div className="metrics"><Metric label="Battery power" value={number(battery?.power_w, ' W', 1)}/><Metric label="Temperature" value={number(battery?.temperature_c, ' °C', 1)}/><Metric label="Cycle count" value={number(battery?.cycles)}/><Metric label="Battery health" value={number(battery?.health, '%', 1)}/></div>
     </section>
 
-    <section className="mechanism" aria-label="Charging mechanism"><span className="mechanism-icon" aria-hidden="true">◇</span><div><strong>{enforced ? 'Simulated firmware control' : 'Software reminders only'}</strong><p>{status.mechanism}</p></div><span className="mechanism-tag">{status.simulated ? 'SIMULATION' : 'READ ONLY'}</span></section>
+    <section className="mechanism" aria-label="Charging mechanism"><span className="mechanism-icon" aria-hidden="true">◇</span><div><strong>{enforced ? 'Simulated firmware control' : 'Software reminders only'}</strong><p>{status.mechanism}</p>{desktop && status.snapshot.fresh && <p className={criticalHeat ? 'reason critical-text' : 'reason'}>{reasonLabel(status.reason, caps.inhibit)}</p>}</div><span className="mechanism-tag">{status.simulated ? 'SIMULATION' : 'READ ONLY'}</span></section>
 
     <section className="card settings" aria-labelledby="limit-heading">
       <div className="section-heading"><div><span className="eyebrow">YOUR DAILY BALANCE</span><h2 id="limit-heading">{enforced ? 'Charge limit' : 'Charge reminder'}</h2></div><div className="limit-value">{draft.limit}<span>%</span></div></div>
@@ -130,14 +149,14 @@ function App() {
 
       <div className="settings-rows">
         <div className={`setting-row ${!caps.thresholds ? 'unavailable' : ''}`}><div><label htmlFor="band">Sailing range</label><p>{caps.thresholds ? 'Let the battery drift before charging again' : 'Requires hardware start / stop thresholds'}</p></div><div className="number-control"><input id="band" type="number" min={caps.set_limit ? 5 : 2} max="20" value={draft.band} disabled={!controls || !caps.thresholds} onChange={(e) => edit({ band: Number(e.target.value) })}/><span>%</span></div></div>
-        <div className={`setting-row ${!canHeat ? 'unavailable' : ''}`}><div><label htmlFor="heat">Heat protection</label><p>{canHeat ? 'Pause charging above the selected temperature' : 'Requires temperature data and charge inhibition'}</p></div><div className="row-actions">{draft.heat_c !== null && <label className="temperature-control"><span className="sr-only">Heat threshold in Celsius</span><input type="number" min="35" max="50" value={draft.heat_c} disabled={!controls || !canHeat} onChange={(e) => edit({ heat_c: Number(e.target.value) })}/>°C</label>}<input id="heat" className="switch" type="checkbox" checked={draft.heat_c !== null} disabled={!controls || !canHeat} onChange={(e) => edit({ heat_c: e.target.checked ? 42 : null })}/></div></div>
+        <div className={`setting-row ${!canHeat ? 'unavailable' : ''}`}><div><label htmlFor="heat">Heat protection</label><p>{canHeat ? 'Pause charging above the selected temperature' : 'Requires temperature data and charge inhibition'}</p>{noTemperature && <p className="heat-note">{noTemperatureNote}</p>}</div><div className="row-actions">{draft.heat_c !== null && <label className="temperature-control"><span className="sr-only">Heat threshold in Celsius</span><input type="number" min="35" max="50" value={draft.heat_c} disabled={!controls || !canHeat} onChange={(e) => edit({ heat_c: Number(e.target.value) })}/>°C</label>}<input id="heat" className="switch" type="checkbox" checked={draft.heat_c !== null} disabled={!controls || !canHeat} onChange={(e) => edit({ heat_c: e.target.checked ? 42 : null })}/></div></div>
         <ToggleRow id="discharge" title="Discharge to limit" description={caps.force_discharge ? 'Use battery power when above your cap on AC' : 'Unavailable: this device cannot force discharge'} checked={draft.discharge} disabled={!controls || !caps.force_discharge} onChange={(value) => edit({ discharge: value })}/>
       </div>
       <div className="apply-row"><p>{dirty ? 'You have unapplied changes.' : 'A quieter routine for your battery.'}</p><button className="primary" disabled={!controls || !dirty || draft.band < (caps.set_limit ? 5 : 2) || draft.band > 20} onClick={() => { void save(); }}>{busy ? 'Working…' : 'Apply settings'}<span aria-hidden="true">↗</span></button></div>
     </section>
 
     <details className="card details"><summary>Preferences & device details<span aria-hidden="true">＋</span></summary><div className="details-body">
-      <ToggleRow id="notifications" title="Threshold notifications" description="A local reminder when it is time to unplug" checked={draft.notifications} disabled={!controls} onChange={(value) => edit({ notifications: value })}/>
+      <ToggleRow id="notifications" title="Threshold notifications" description="Unplug reminders and top-up notices. Critical heat warnings are always shown." checked={draft.notifications} disabled={!controls} onChange={(value) => edit({ notifications: value })}/>
       <ToggleRow id="login" title="Launch at login" description="Start in your Windows user session" checked={login} disabled={!connected} onChange={(value) => { void action(async () => { await invoke('set_launch_at_login', { enabled: value }); setLogin(value); }); }}/>
       <div className="device-info"><span className="eyebrow">CONNECTED DEVICE</span><strong>{status.discovery.model || 'Device not identified'}</strong><p>{status.discovery.manufacturer || (desktop ? 'Hardware discovery unavailable' : 'Windows desktop app required')}{status.discovery.bios ? ` · BIOS ${status.discovery.bios}` : ''}</p><p>{status.discovery.note}</p><p className="hint">Missing readings are shown as —. No battery temperature or health values are estimated.</p>
         {desktop && /^dell\b/i.test(status.discovery.manufacturer) && !status.discovery.wmi && !status.discovery.cctk && <p>For Dell hardware support, install <button className="text-link" disabled={!connected} onClick={() => { void action(() => invoke('open_dell_support')); }}>Dell Command | Configure</button>. This development build still requires a validated controller before firmware changes.</p>}
