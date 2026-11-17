@@ -13,6 +13,16 @@ pub const CHARGE_PHASE_TIMEOUT_SECS: u64 = 4 * 60 * 60;
 pub const TEMPORARY_MODE_TIMEOUT_SECS: u64 = 12 * 60 * 60;
 /// Calibration holds at full for this long before discharging.
 pub const FULL_HOLD_SECS: u64 = 600;
+/// Hard stop for charging, independent of the user's heat setting and of the
+/// safety floor. Li-ion cells are normally specified for charging up to about
+/// 45 °C; charging hotter accelerates degradation and raises the risk of
+/// lithium plating and thermal runaway. 50 °C leaves margin above that spec
+/// while still catching a pack that is genuinely too hot to charge, so at or
+/// above it charging stops even when the lowest pack is below the safety floor.
+pub const CRITICAL_TEMP_C: f64 = 50.0;
+/// The critical-heat stop is released only once the hottest pack reads below
+/// this temperature (the top of the usual Li-ion charging range).
+pub const CRITICAL_TEMP_RELEASE_C: f64 = 45.0;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,6 +65,11 @@ impl Config {
         if !(50..=100).contains(&self.limit) || !(2..=20).contains(&self.band) {
             return Err("Limit must be 50–100%; sailing band must be 2–20%".into());
         }
+        if self.heat_c.is_some_and(|t| f64::from(t) > CRITICAL_TEMP_C) {
+            return Err(format!(
+                "Heat threshold cannot be above the {CRITICAL_TEMP_C} °C critical stop"
+            ));
+        }
         if self.heat_c.is_some_and(|t| !(35..=50).contains(&t)) {
             return Err("Heat threshold must be 35–50 °C".into());
         }
@@ -89,6 +104,20 @@ pub enum Phase {
     Complete,
 }
 
+/// One-shot messages for the user. Each is emitted on a single `Decision`
+/// (edge-triggered), whatever the provider's capabilities: on a monitor-only
+/// device telling the user is the only protection there is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Notice {
+    /// A top-up began charging to full.
+    TopUpStarted,
+    /// The top-up reached full; the battery now stays full while on AC.
+    TopUpComplete,
+    /// The critical-heat stop engaged: charging stopped, even below the floor.
+    CriticalHeat,
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub struct Decision {
     pub phase: Phase,
@@ -98,6 +127,20 @@ pub struct Decision {
     pub restore: bool,
     pub reminder: bool,
     pub reason: &'static str,
+    pub notice: Option<Notice>,
+}
+
+/// Hottest pack temperature from a fresh snapshot, if any pack reports one.
+/// Any finite reading counts, even one outside the plausible sensor range.
+fn hottest_reading(s: &Snapshot) -> Option<f64> {
+    if !s.fresh {
+        return None;
+    }
+    s.batteries
+        .iter()
+        .filter_map(|b| b.temperature_c)
+        .filter(|t| t.is_finite())
+        .reduce(f64::max)
 }
 
 pub struct Engine {
@@ -118,6 +161,15 @@ pub struct Engine {
     /// limit while still on AC. Cleared by unplugging or dropping to the limit.
     keep_full: bool,
     last_limit: Option<u8>,
+    /// Critical-heat latch (enter at CRITICAL_TEMP_C, release below
+    /// CRITICAL_TEMP_RELEASE_C). Held while no fresh temperature is available.
+    critical: bool,
+    /// A top-up charge-to-full phase was entered during this step.
+    top_up_began: bool,
+    /// A top-up reached full during this step.
+    top_up_finished: bool,
+    /// Notices not yet delivered (at most one is delivered per step).
+    notices: Vec<Notice>,
 }
 impl Default for Engine {
     fn default() -> Self {
@@ -134,6 +186,10 @@ impl Default for Engine {
             mode_since: None,
             keep_full: false,
             last_limit: None,
+            critical: false,
+            top_up_began: false,
+            top_up_finished: false,
+            notices: Vec::new(),
         }
     }
 }
@@ -153,8 +209,41 @@ impl Engine {
         self.mode_since = None;
         self.keep_full = true;
     }
+    /// Never charge and never discharge: the critical-heat stop. Overrides the
+    /// safety floor, every mode and the user's heat setting.
+    fn critical_stop(&self, mut d: Decision, caps: Capabilities) -> Decision {
+        d.phase = self.phase;
+        d.inhibit = caps.inhibit;
+        d.discharge = false;
+        d.restore = false;
+        d.reminder = false;
+        d.reason = "critical_heat";
+        d
+    }
     /// `now` is monotonic seconds, never wall-clock or a time zone dependent value.
     pub fn step(&mut self, c: &Config, s: &Snapshot, caps: Capabilities, now: u64) -> Decision {
+        let was_critical = self.critical;
+        self.top_up_began = false;
+        self.top_up_finished = false;
+        let mut d = self.decide(c, s, caps, now);
+        // Edge-triggered notices, independent of capabilities. Critical heat
+        // jumps the queue; anything else waits for the following steps.
+        if self.critical && !was_critical {
+            self.notices.insert(0, Notice::CriticalHeat);
+        }
+        let top_up_active = self.mode == Mode::TopUp && self.phase == Phase::TopUp;
+        if self.top_up_began && (top_up_active || self.top_up_finished) {
+            self.notices.push(Notice::TopUpStarted);
+        }
+        if self.top_up_finished {
+            self.notices.push(Notice::TopUpComplete);
+        }
+        if !self.notices.is_empty() {
+            d.notice = Some(self.notices.remove(0));
+        }
+        d
+    }
+    fn decide(&mut self, c: &Config, s: &Snapshot, caps: Capabilities, now: u64) -> Decision {
         let mut d = Decision {
             phase: self.phase,
             inhibit: false,
@@ -163,17 +252,30 @@ impl Engine {
             restore: false,
             reminder: false,
             reason: "Monitoring",
+            notice: None,
         };
         let backwards = self
             .last_time
             .is_some_and(|last| now < last || now - last > 30);
         self.last_time = Some(now);
+        // Critical-heat latch, whatever the configuration or capabilities. With
+        // no fresh temperature it neither engages nor releases.
+        if let Some(hottest) = hottest_reading(s) {
+            if hottest >= CRITICAL_TEMP_C {
+                self.critical = true;
+            } else if hottest < CRITICAL_TEMP_RELEASE_C {
+                self.critical = false;
+            }
+        }
         if c.validate_for(caps).is_err() || !s.valid() || backwards {
             self.holding = false;
             self.hot = false;
             self.hold_since = None;
             self.cancel_temporary_mode();
             d.phase = self.phase;
+            if self.critical {
+                return self.critical_stop(d, caps);
+            }
             d.restore = true;
             d.reason = "Telemetry unavailable or resumed; restore safe defaults";
             return d;
@@ -212,8 +314,14 @@ impl Engine {
             let temporary = c.mode != Mode::Limit;
             self.phase_since = temporary.then_some(now);
             self.mode_since = temporary.then_some(now);
+            self.top_up_began = c.mode == Mode::TopUp;
         }
-        // Floor precedence: the floor wins over limit holds, heat and modes.
+        // Critical heat beats everything, including the safety floor.
+        if self.critical {
+            return self.critical_stop(d, caps);
+        }
+        // Floor precedence: the floor wins over limit holds, normal heat
+        // protection and modes.
         if low <= SAFETY_FLOOR {
             self.floor_active = true;
         } else if low >= FLOOR_RELEASE {
@@ -247,6 +355,13 @@ impl Engine {
             return d;
         }
         if c.mode == Mode::TopUp && !(caps.set_limit || caps.inhibit) {
+            // Nothing here can limit charging, so the pack charges to full on
+            // its own; still follow the top-up so the user is told when it is.
+            if self.phase == Phase::TopUp && full {
+                self.complete();
+                self.top_up_finished = true;
+            }
+            d.phase = self.phase;
             d.restore = true;
             d.reason = "Top-up unsupported by provider";
             return d;
@@ -291,6 +406,7 @@ impl Engine {
                     self.phase_since = None;
                 } else {
                     self.complete();
+                    self.top_up_finished = c.mode == Mode::TopUp;
                 }
             }
             Phase::Recharging if full => self.complete(),
@@ -786,6 +902,255 @@ mod tests {
                 ..Config::default()
             };
             assert!(c.validate_for(hw).is_ok(), "{limit}/{band}");
+        }
+    }
+    #[test]
+    fn critical_heat_beats_the_safety_floor() {
+        for heat_c in [None, Some(42)] {
+            let c = Config {
+                heat_c,
+                ..Config::default()
+            };
+            let mut e = Engine::default();
+            let d = e.step(&c, &sample(10., Some(CRITICAL_TEMP_C)), caps(), 0);
+            assert!(d.inhibit && !d.restore && !d.discharge, "{heat_c:?}");
+            assert_eq!(d.reason, "critical_heat");
+            // Multi-pack: one hot pack stops charging even with a pack at 15%.
+            let mut s = packs(&[15., 60.]);
+            s.batteries[1].temperature_c = Some(55.);
+            let d = Engine::default().step(&c, &s, caps(), 0);
+            assert!(d.inhibit && !d.restore, "{heat_c:?}");
+        }
+        // Every mode, and even an invalid or stale reading once latched.
+        for mode in [Mode::Limit, Mode::TopUp, Mode::Calibration] {
+            let c = Config {
+                mode,
+                ..Config::default()
+            };
+            let d = Engine::default().step(&c, &sample(30., Some(51.)), caps(), 0);
+            assert!(d.inhibit && !d.discharge, "{mode:?}");
+            assert_eq!(d.reason, "critical_heat");
+        }
+        let mut e = Engine::default();
+        e.step(&Config::default(), &sample(30., Some(51.)), caps(), 0);
+        let mut stale = sample(10., Some(51.));
+        stale.fresh = false;
+        let d = e.step(&Config::default(), &stale, caps(), 10);
+        assert!(d.inhibit && !d.restore);
+        // No temperature at all: the critical tier never triggers.
+        let d = Engine::default().step(&Config::default(), &sample(10., None), caps(), 0);
+        assert!(d.restore && !d.inhibit);
+    }
+    #[test]
+    fn normal_heat_below_critical_does_not_beat_the_floor() {
+        let c = Config {
+            heat_c: Some(40),
+            ..Config::default()
+        };
+        let mut e = Engine::default();
+        let d = e.step(&c, &sample(10., Some(49.9)), caps(), 0);
+        assert!(d.restore && !d.inhibit);
+        assert_ne!(d.reason, "critical_heat");
+        // Above the floor, normal heat protection still pauses charging.
+        assert!(e.step(&c, &sample(30., Some(45.)), caps(), 10).inhibit);
+    }
+    #[test]
+    fn critical_heat_latch_has_hysteresis() {
+        let c = Config::default();
+        let mut e = Engine::default();
+        for (i, (t, critical)) in [
+            (49.9, false),
+            (50., true),
+            (47., true),
+            (45., true),
+            (44.9, false),
+            (49., false),
+            (50.5, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let d = e.step(&c, &sample(15., Some(t)), caps(), i as u64);
+            assert_eq!(d.reason == "critical_heat", critical, "{t}");
+            assert_eq!(d.inhibit, critical, "{t}");
+            assert_eq!(d.restore, !critical, "{t}");
+        }
+    }
+    #[test]
+    fn critical_heat_never_discharges() {
+        let c = Config {
+            discharge: true,
+            ..Config::default()
+        };
+        let mut e = Engine::default();
+        assert!(e.step(&c, &sample(95., Some(30.)), caps(), 0).discharge);
+        let d = e.step(&c, &sample(95., Some(55.)), caps(), 10);
+        assert!(!d.discharge && d.inhibit);
+        // Calibration mid-discharge: the discharge stops too.
+        let cal = Config {
+            mode: Mode::Calibration,
+            ..Config::default()
+        };
+        let mut e = Engine::default();
+        let mut now = 0;
+        while now <= FULL_HOLD_SECS {
+            e.step(&cal, &sample(100., Some(30.)), caps(), now);
+            now += 10;
+        }
+        let d = e.step(&cal, &sample(90., Some(30.)), caps(), now);
+        assert_eq!(d.phase, Phase::Discharging);
+        assert!(d.discharge);
+        let d = e.step(&cal, &sample(89., Some(52.)), caps(), now + 10);
+        assert!(!d.discharge && d.inhibit);
+    }
+    fn notices(
+        e: &mut Engine,
+        c: &Config,
+        steps: &[(f64, Option<f64>)],
+        caps: Capabilities,
+    ) -> Vec<Notice> {
+        steps
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (p, t))| e.step(c, &sample(*p, *t), caps, i as u64 * 10).notice)
+            .collect()
+    }
+    #[test]
+    fn notices_fire_exactly_once_with_and_without_capabilities() {
+        let top_up = Config {
+            mode: Mode::TopUp,
+            ..Config::default()
+        };
+        let run = [
+            (80., None),
+            (90., None),
+            (99., None),
+            (100., None),
+            (100., None),
+        ];
+        for c in [caps(), Capabilities::default()] {
+            let mut e = Engine::default();
+            let d = e.step(&top_up, &sample(80., None), c, 0);
+            assert_eq!(d.notice, Some(Notice::TopUpStarted), "{c:?}");
+            assert_eq!(e.step(&top_up, &sample(90., None), c, 10).notice, None);
+            let d = e.step(&top_up, &sample(99., None), c, 20);
+            assert_eq!(d.notice, Some(Notice::TopUpComplete), "{c:?}");
+            assert_eq!(d.phase, Phase::Complete);
+            let mut e = Engine::default();
+            assert_eq!(
+                notices(&mut e, &top_up, &run, c),
+                [Notice::TopUpStarted, Notice::TopUpComplete],
+                "{c:?}"
+            );
+            // Already full when switched on: started, then complete next step.
+            let mut e = Engine::default();
+            assert_eq!(
+                notices(
+                    &mut e,
+                    &top_up,
+                    &[(100., None), (100., None), (100., None)],
+                    c
+                ),
+                [Notice::TopUpStarted, Notice::TopUpComplete],
+                "{c:?}"
+            );
+            // Critical heat: once per engagement, again only after release.
+            let mut e = Engine::default();
+            let heat = [
+                (60., Some(30.)),
+                (60., Some(50.)),
+                (60., Some(55.)),
+                (60., Some(46.)),
+                (60., Some(44.)),
+                (60., Some(40.)),
+                (60., Some(51.)),
+                (60., Some(51.)),
+            ];
+            let mut seen = Vec::new();
+            for (i, (p, t)) in heat.into_iter().enumerate() {
+                let d = e.step(&Config::default(), &sample(p, t), c, i as u64 * 10);
+                assert!(!d.discharge);
+                seen.push(d.notice);
+            }
+            let critical = Some(Notice::CriticalHeat);
+            assert_eq!(
+                seen,
+                [None, critical, None, None, None, None, critical, None],
+                "{c:?}"
+            );
+        }
+        // A top-up cancelled by an unplug in the same step never announces.
+        let mut s = sample(80., None);
+        s.ac = Some(false);
+        assert_eq!(Engine::default().step(&top_up, &s, caps(), 0).notice, None);
+        // Critical heat while starting a top-up: both are delivered, heat first.
+        let mut e = Engine::default();
+        assert_eq!(
+            notices(
+                &mut e,
+                &top_up,
+                &[(80., Some(55.)), (80., Some(55.)), (80., Some(55.))],
+                caps()
+            ),
+            [Notice::CriticalHeat, Notice::TopUpStarted]
+        );
+    }
+    #[test]
+    fn top_up_then_stays_full_without_draining() {
+        let c = Config {
+            mode: Mode::TopUp,
+            discharge: true,
+            ..Config::default()
+        };
+        let mut e = Engine::default();
+        e.step(&c, &sample(90., None), caps(), 0);
+        assert_eq!(
+            e.step(&c, &sample(100., None), caps(), 10).notice,
+            Some(Notice::TopUpComplete)
+        );
+        for now in (20..400).step_by(10) {
+            let d = e.step(&c, &sample(100., None), caps(), now);
+            assert_eq!(d.phase, Phase::Complete);
+            assert!(!d.discharge && !d.restore, "t={now}");
+            assert_eq!(d.notice, None);
+        }
+    }
+    #[test]
+    fn heat_threshold_above_critical_is_rejected() {
+        let hot = Config {
+            heat_c: Some(51),
+            ..Config::default()
+        };
+        let err = hot.validate().unwrap_err();
+        assert!(err.contains("critical"), "{err}");
+        assert!(hot.validate_for(caps()).is_err());
+        assert!(Config {
+            heat_c: Some(50),
+            ..Config::default()
+        }
+        .validate()
+        .is_ok());
+    }
+    #[test]
+    fn notice_serializes_snake_case() {
+        let d = Engine::default().step(
+            &Config {
+                mode: Mode::TopUp,
+                ..Config::default()
+            },
+            &sample(80., None),
+            caps(),
+            0,
+        );
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains(r#""notice":"top_up_started""#), "{json}");
+        for (n, name) in [
+            (Notice::TopUpStarted, "\"top_up_started\""),
+            (Notice::TopUpComplete, "\"top_up_complete\""),
+            (Notice::CriticalHeat, "\"critical_heat\""),
+        ] {
+            assert_eq!(serde_json::to_string(&n).unwrap(), name);
+            assert_eq!(serde_json::from_str::<Notice>(name).unwrap(), n);
         }
     }
     #[test]

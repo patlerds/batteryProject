@@ -1,4 +1,4 @@
-use crate::policy::{Config, Decision, Engine, Mode, Phase};
+use crate::policy::{Config, Decision, Engine, Mode, Notice, Phase};
 use crate::{Battery, BatteryProvider, Capabilities, ChargeController, Snapshot};
 use serde::Serialize;
 
@@ -7,6 +7,7 @@ pub struct Simulation {
     pub snapshot: Snapshot,
     pub phase: Phase,
     pub reason: String,
+    pub notice: Option<Notice>,
     pub start: u8,
     pub stop: u8,
 }
@@ -138,6 +139,7 @@ impl Simulator {
             snapshot: self.snapshot()?,
             phase: decision.phase,
             reason: decision.reason.into(),
+            notice: decision.notice,
             start: self.start,
             stop: self.stop,
         })
